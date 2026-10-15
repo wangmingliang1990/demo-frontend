@@ -1,0 +1,66 @@
+# 前端集成测试流水线：验证"新后端镜像 + 前端"真实联调
+# 触发方式不是 push，而是等后端 CI 发来的 repository_dispatch 事件
+# （即：后端镜像更新 → 这条流水线自动开跑）
+
+name: Integration against backend image
+
+on:
+  # 后端 notify-frontend job 推送成功后触发，事件里带着新镜像地址
+  repository_dispatch:
+    types: [backend-image-updated]
+  # 兜底：也可以在 Actions 页面手动点 "Run workflow"，自己填镜像地址
+  workflow_dispatch:
+    inputs:
+      image:
+        description: backend image to test
+        default: ghcr.io/wangmingliang1990/demo-backend:latest
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 把"本次该测哪个镜像"统一成一个变量，供后面步骤使用
+      - name: Resolve backend image
+        id: img
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            # 自动触发：镜像地址来自后端传来的事件负载
+            echo "image=${{ github.event.client_payload.image }}" >> "$GITHUB_OUTPUT"
+          else
+            # 手动触发：用表单里填的值
+            echo "image=${{ inputs.image }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 关键一步：把后端镜像拉下来并作为容器运行（这就是"前端发现后端镜像更新"的落地）
+      - name: Start backend from image
+        run: |
+          docker pull "$IMAGE"
+          docker run -d --name backend -p 8010:8010 "$IMAGE"
+          # 轮询健康检查，最多等 30 秒；超时就判定失败
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8010/api/health && break
+            [ "$i" = 30 ] && echo "backend 启动超时" && exit 1
+            sleep 1
+          done
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+
+      # 前端服务指向容器化的后端，然后跑端到端测试
+      - name: Run frontend and integration tests
+        run: |
+          pip install -r requirements.txt
+          BACKEND_URL=http://127.0.0.1:8010 \
+            uvicorn app.main:app --port 8011 &      # & 让前端在后台运行
+          sleep 2
+          pytest integration -v                     # 注意：跑的是 integration 目录，不是 tests 单元测试
+
+      # 测试失败时把后端容器日志打出来，方便排查是镜像的问题还是代码的问题
+      - name: Show backend logs on failure
+        if: failure()
+        run: docker logs backend
